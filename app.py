@@ -1,6 +1,7 @@
 import os
 import csv
 import uuid
+import tempfile
 from datetime import datetime
 from google import genai
 from google.genai import types
@@ -30,7 +31,7 @@ client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
 
 # 4. 고유 세션 ID 및 대화 상태 초기화
 if "session_id" not in st.session_state:
-    st.session_state.session_id = str(uuid.uuid4()) # 대화-피드백 연결을 위한 고유 ID 발급
+    st.session_state.session_id = str(uuid.uuid4())
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -45,14 +46,15 @@ if "feedback_submitted" not in st.session_state:
     st.session_state.feedback_submitted = False
 
 # ---------------------------------------------------------
-# 📊 데이터 로깅 설정 (Session ID 및 미답변 추적 반영)
+# 📊 데이터 로깅 설정 (Streamlit Cloud 대응 /tmp 폴더 활용)
 # ---------------------------------------------------------
-FEEDBACK_FILE = "feedback_log_v2.csv"
-CHAT_LOG_FILE = "chat_log_v2.csv"
-UNANSWERED_LOG_FILE = "unanswered_log.csv"
-VISITOR_FILE = "visitor_count.txt"
+TMP_DIR = tempfile.gettempdir()
 
-# 피드백 CSV 초기화 (session_id 추가)
+FEEDBACK_FILE = os.path.join(TMP_DIR, "feedback_log_v2.csv")
+CHAT_LOG_FILE = os.path.join(TMP_DIR, "chat_log_v2.csv")
+UNANSWERED_LOG_FILE = os.path.join(TMP_DIR, "unanswered_log.csv")
+VISITOR_FILE = os.path.join(TMP_DIR, "visitor_count.txt")
+
 if not os.path.exists(FEEDBACK_FILE):
     with open(FEEDBACK_FILE, mode="w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
@@ -62,19 +64,20 @@ if not os.path.exists(FEEDBACK_FILE):
             "alt_action", "time_saved", "avg_score", "good_feedback", "improve_feedback"
         ])
 
-# 질문 로그 CSV 초기화 (session_id 및 ai_response 추가)
 if not os.path.exists(CHAT_LOG_FILE):
     with open(CHAT_LOG_FILE, mode="w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
         writer.writerow(["timestamp", "session_id", "user_question", "ai_response"])
 
-# 미답변 질문 로그 CSV 초기화 (Knowledge Gap 분석용)
 if not os.path.exists(UNANSWERED_LOG_FILE):
     with open(UNANSWERED_LOG_FILE, mode="w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
         writer.writerow(["timestamp", "session_id", "unanswered_question"])
 
-# 방문자 수 카운팅
+if not os.path.exists(VISITOR_FILE):
+    with open(VISITOR_FILE, mode="w", encoding="utf-8") as f:
+        f.write("0")
+
 if "counted_as_visitor" not in st.session_state:
     st.session_state.counted_as_visitor = True
     try:
@@ -134,21 +137,24 @@ with st.sidebar:
         st.session_state.chat_started = False
         st.session_state.open_feedback_form = False
         st.session_state.feedback_submitted = False
-        st.session_state.session_id = str(uuid.uuid4()) # 초기화 시 새로운 세션 발급
+        st.session_state.session_id = str(uuid.uuid4())
         st.rerun()
 
     st.divider()
 
     # 🔒 관리자 전용 대시보드 (비밀번호: 1128)
-    with st.expander("🔒 관리자 전용 (데이터 분석)"):
+    with st.expander("🔒 관리자 전용"):
         admin_pw = st.text_input("관리자 비밀번호 입력", type="password", key="admin_pw_input")
         correct_pw = st.secrets.get("ADMIN_PASSWORD", "1128")
         
         if admin_pw == correct_pw:
-            st.success("인증 성공! 데이터 대시보드가 활성화되었습니다.")
+            st.success("관리자 인증 성공!")
             
-            with open(VISITOR_FILE, "r", encoding="utf-8") as f:
-                total_visitors = f.read().strip()
+            try:
+                with open(VISITOR_FILE, "r", encoding="utf-8") as f:
+                    total_visitors = f.read().strip()
+            except:
+                total_visitors = "0"
                 
             total_questions = len(pd.read_csv(CHAT_LOG_FILE)) if os.path.exists(CHAT_LOG_FILE) else 0
             total_unanswered = len(pd.read_csv(UNANSWERED_LOG_FILE)) if os.path.exists(UNANSWERED_LOG_FILE) else 0
@@ -157,9 +163,8 @@ with st.sidebar:
             col1, col2 = st.columns(2)
             col1.metric("총 방문자 수", f"{total_visitors}명")
             col2.metric("총 질문 수", f"{total_questions}건")
-            st.metric("🚨 미답변 발생 건수", f"{total_unanswered}건 (보완 필요)")
+            st.metric("🚨 미답변 발생 건수", f"{total_unanswered}건")
             
-            # 다운로드 버튼 모음
             st.markdown("#### 💾 데이터 추출")
             if total_questions > 0:
                 with open(CHAT_LOG_FILE, "rb") as file:
@@ -255,13 +260,11 @@ else:
             st.markdown(ai_text)
             st.session_state.messages.append({"role": "assistant", "content": ai_text})
             
-            # 📝 [로깅 1] 대화 내역 전체 저장 (Session ID 포함)
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             with open(CHAT_LOG_FILE, mode="a", newline="", encoding="utf-8-sig") as f:
                 writer = csv.writer(f)
                 writer.writerow([timestamp, st.session_state.session_id, prompt, ai_text])
                 
-            # 🚨 [로깅 2] 미답변(Knowledge Gap) 발생 시 별도 저장
             fallback_phrase = "해당 내용은 제공된 공고문 및 특별법에서 확인할 수 없습니다"
             if fallback_phrase in ai_text:
                 with open(UNANSWERED_LOG_FILE, mode="a", newline="", encoding="utf-8-sig") as f:
@@ -346,7 +349,6 @@ else:
                         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         avg_score = round((f_solving + f_accuracy + f_reliability + f_speed + f_attitude + f_readability + f_efficiency) / 7, 2)
                         
-                        # 📝 [로깅 3] 피드백 저장 (Session ID 포함)
                         with open(FEEDBACK_FILE, mode="a", newline="", encoding="utf-8-sig") as f:
                             writer = csv.writer(f)
                             writer.writerow([
