@@ -1,13 +1,13 @@
 import os
-import csv
 import uuid
-import tempfile
 from datetime import datetime
 from google import genai
 from google.genai import types
 import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
+import gspread
+from google.oauth2.service_account import Credentials
 
 # 1. 웹 브라우저 탭 아이콘 및 제목 설정
 st.set_page_config(
@@ -16,7 +16,7 @@ st.set_page_config(
     layout="wide"
 )
 
-# 웹페이지 언어를 '한국어(ko)'로 강제 변경 (크롬 자동 번역 방지)
+# 웹페이지 언어를 '한국어(ko)'로 강제 변경
 components.html(
     """
     <script>
@@ -46,47 +46,54 @@ if "feedback_submitted" not in st.session_state:
     st.session_state.feedback_submitted = False
 
 # ---------------------------------------------------------
-# 📊 데이터 로깅 설정 (Streamlit Cloud 대응 /tmp 폴더 활용)
+# 📊 구글 시트(Google Sheets) 연동 및 워크시트 설정
 # ---------------------------------------------------------
-TMP_DIR = tempfile.gettempdir()
+@st.cache_resource
+def init_google_sheets():
+    scope = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
+    creds_dict = dict(st.secrets["gcp_service_account"])
+    creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
+    gc = gspread.authorize(creds)
+    
+    # "LH_Chatbot_Data" 스프레드시트 오픈
+    sheet = gc.open("LH_Chatbot_Data")
+    return sheet
 
-FEEDBACK_FILE = os.path.join(TMP_DIR, "feedback_log_v2.csv")
-CHAT_LOG_FILE = os.path.join(TMP_DIR, "chat_log_v2.csv")
-UNANSWERED_LOG_FILE = os.path.join(TMP_DIR, "unanswered_log.csv")
-VISITOR_FILE = os.path.join(TMP_DIR, "visitor_count.txt")
+def get_or_create_worksheet(sheet, title, headers):
+    try:
+        ws = sheet.worksheet(title)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sheet.add_worksheet(title=title, rows=1000, cols=20)
+        ws.append_row(headers)
+    return ws
 
-if not os.path.exists(FEEDBACK_FILE):
-    with open(FEEDBACK_FILE, mode="w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            "timestamp", "session_id", "problem_solving", "accuracy", "reliability", 
-            "speed", "attitude", "readability", "efficiency", 
-            "alt_action", "time_saved", "avg_score", "good_feedback", "improve_feedback"
-        ])
+try:
+    gc_sheet = init_google_sheets()
+    
+    # 탭별 워크시트 자동 생성 및 헤더 초기화
+    chat_ws = get_or_create_worksheet(gc_sheet, "chat_logs", ["timestamp", "session_id", "user_question", "ai_response"])
+    unanswered_ws = get_or_create_worksheet(gc_sheet, "unanswered_logs", ["timestamp", "session_id", "unanswered_question"])
+    feedback_ws = get_or_create_worksheet(gc_sheet, "feedback_logs", [
+        "timestamp", "session_id", "problem_solving", "accuracy", "reliability", 
+        "speed", "attitude", "readability", "efficiency", 
+        "alt_action", "time_saved", "avg_score", "good_feedback", "improve_feedback"
+    ])
+    visitor_ws = get_or_create_worksheet(gc_sheet, "visitors", ["timestamp", "session_id"])
 
-if not os.path.exists(CHAT_LOG_FILE):
-    with open(CHAT_LOG_FILE, mode="w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.writer(f)
-        writer.writerow(["timestamp", "session_id", "user_question", "ai_response"])
+except Exception as e:
+    st.error(f"⚠️ 구글 시트 연동 중 오류가 발생했습니다. Secrets 설정을 확인해주세요. 상세 오류: {e}")
+    st.stop()
 
-if not os.path.exists(UNANSWERED_LOG_FILE):
-    with open(UNANSWERED_LOG_FILE, mode="w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.writer(f)
-        writer.writerow(["timestamp", "session_id", "unanswered_question"])
-
-if not os.path.exists(VISITOR_FILE):
-    with open(VISITOR_FILE, mode="w", encoding="utf-8") as f:
-        f.write("0")
-
+# 방문자 수 카운팅 (세션당 1회 구글 시트에 기록)
 if "counted_as_visitor" not in st.session_state:
     st.session_state.counted_as_visitor = True
     try:
-        with open(VISITOR_FILE, "r", encoding="utf-8") as f:
-            count = int(f.read().strip())
-    except ValueError:
-        count = 0
-    with open(VISITOR_FILE, "w", encoding="utf-8") as f:
-        f.write(str(count + 1))
+        visitor_ws.append_row([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), st.session_state.session_id])
+    except Exception as e:
+        pass
 
 # ---------------------------------------------------------
 # 🌟 공고문 및 특별법 PDF 자동 내장
@@ -142,45 +149,48 @@ with st.sidebar:
 
     st.divider()
 
-    # 🔒 관리자 전용 대시보드 (비밀번호: 1128)
-    with st.expander("🔒 관리자 전용"):
+    # 🔒 관리자 전용 대시보드 (구글 시트 데이터 연동)
+    with st.expander("🔒 관리자 전용 (데이터 분석)"):
         admin_pw = st.text_input("관리자 비밀번호 입력", type="password", key="admin_pw_input")
         correct_pw = st.secrets.get("ADMIN_PASSWORD", "1128")
         
         if admin_pw == correct_pw:
-            st.success("관리자 인증 성공!")
+            st.success("인증 성공! 대시보드 활성화")
             
             try:
-                with open(VISITOR_FILE, "r", encoding="utf-8") as f:
-                    total_visitors = f.read().strip()
-            except:
-                total_visitors = "0"
+                # 구글 시트에서 실시간 데이터 로드
+                visitors_data = visitor_ws.get_all_records()
+                chat_data = chat_ws.get_all_records()
+                unanswered_data = unanswered_ws.get_all_records()
+                feedback_data = feedback_ws.get_all_records()
                 
-            total_questions = len(pd.read_csv(CHAT_LOG_FILE)) if os.path.exists(CHAT_LOG_FILE) else 0
-            total_unanswered = len(pd.read_csv(UNANSWERED_LOG_FILE)) if os.path.exists(UNANSWERED_LOG_FILE) else 0
+                total_visitors = len(visitors_data)
+                total_questions = len(chat_data)
+                total_unanswered = len(unanswered_data)
                 
-            st.markdown("#### 📈 이용자 현황")
-            col1, col2 = st.columns(2)
-            col1.metric("총 방문자 수", f"{total_visitors}명")
-            col2.metric("총 질문 수", f"{total_questions}건")
-            st.metric("🚨 미답변 발생 건수", f"{total_unanswered}건")
-            
-            st.markdown("#### 💾 데이터 추출")
-            if total_questions > 0:
-                with open(CHAT_LOG_FILE, "rb") as file:
-                    st.download_button("📥 1. 전체 질문 로그 (.csv)", file, "chat_log.csv", "text/csv")
-                    
-            if total_unanswered > 0:
-                with open(UNANSWERED_LOG_FILE, "rb") as file:
-                    st.download_button("📥 2. 미답변 질문 리스트 (.csv)", file, "unanswered_log.csv", "text/csv")
-            
-            if os.path.exists(FEEDBACK_FILE):
-                df_feedback = pd.read_csv(FEEDBACK_FILE)
-                if len(df_feedback) > 0:
+                st.markdown("#### 📈 이용자 현황 (구글 시트 연동)")
+                col1, col2 = st.columns(2)
+                col1.metric("총 방문자 수", f"{total_visitors}명")
+                col2.metric("총 질문 수", f"{total_questions}건")
+                st.metric("🚨 미답변 발생 건수", f"{total_unanswered}건")
+                
+                st.markdown("#### 💾 데이터 다운로드")
+                if total_questions > 0:
+                    df_chat = pd.DataFrame(chat_data)
+                    st.download_button("📥 전체 질문 로그 (.csv)", df_chat.to_csv(index=False).encode('utf-8-sig'), "chat_log.csv", "text/csv")
+                        
+                if total_unanswered > 0:
+                    df_unanswered = pd.DataFrame(unanswered_data)
+                    st.download_button("📥 미답변 질문 리스트 (.csv)", df_unanswered.to_csv(index=False).encode('utf-8-sig'), "unanswered_log.csv", "text/csv")
+                
+                if len(feedback_data) > 0:
+                    df_feedback = pd.DataFrame(feedback_data)
                     overall_avg = round(df_feedback['avg_score'].mean(), 2)
                     st.metric(label="전체 평균 만족도", value=f"{overall_avg} / 5.0점")
-                    with open(FEEDBACK_FILE, "rb") as file:
-                        st.download_button("📥 3. 만족도 평가 결과 (.csv)", file, "service_feedback.csv", "text/csv")
+                    st.download_button("📥 만족도 평가 결과 (.csv)", df_feedback.to_csv(index=False).encode('utf-8-sig'), "service_feedback.csv", "text/csv")
+            except Exception as e:
+                st.error(f"데이터를 불러오는 중 오류 발생: {e}")
+                
         elif admin_pw:
             st.error("비밀번호가 올바르지 않습니다.")
 
@@ -226,7 +236,7 @@ else:
     \n\n[초우선 필수 지침]
     1. 당신은 오직 제공된 문서(PDF)들의 내용만을 바탕으로 답변해야 합니다.
     2. 문서에 없는 내용이나 유추해야 하는 내용은 절대 지어내지 마십시오.
-    3. 문서에서 정답을 찾을 수 없는 경우, 반드시 "해당 내용은 제공된 공고문 및 특별법에서 확인할 수 없습니다. 관할 지사에 문의하시기 바랍니다."라고만 답변하십시오. (이 문구를 정확히 유지하세요)
+    3. 문서에서 정답을 찾을 수 없는 경우, 반드시 "해당 내용은 제공된 공고문 및 특별법에서 확인할 수 없습니다. 관할 지사에 문의하시기 바랍니다."라고만 답변하십시오.
     4. [근거 출처 필수 명시] 답변을 작성할 때, 내용의 근거가 되는 문서명(통합공고문 또는 특별법)과 함께 해당 조항, 장/절 등을 명시해 주십시오.
     """
 
@@ -261,15 +271,20 @@ else:
             st.session_state.messages.append({"role": "assistant", "content": ai_text})
             
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            with open(CHAT_LOG_FILE, mode="a", newline="", encoding="utf-8-sig") as f:
-                writer = csv.writer(f)
-                writer.writerow([timestamp, st.session_state.session_id, prompt, ai_text])
+            
+            # 구글 시트에 질문 로그 기록
+            try:
+                chat_ws.append_row([timestamp, st.session_state.session_id, prompt, ai_text])
+            except Exception as e:
+                pass
                 
+            # 미답변 질문 감지 시 구글 시트에 기록
             fallback_phrase = "해당 내용은 제공된 공고문 및 특별법에서 확인할 수 없습니다"
             if fallback_phrase in ai_text:
-                with open(UNANSWERED_LOG_FILE, mode="a", newline="", encoding="utf-8-sig") as f:
-                    writer = csv.writer(f)
-                    writer.writerow([timestamp, st.session_state.session_id, prompt])
+                try:
+                    unanswered_ws.append_row([timestamp, st.session_state.session_id, prompt])
+                except Exception as e:
+                    pass
 
             st.rerun()
 
@@ -349,13 +364,15 @@ else:
                         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         avg_score = round((f_solving + f_accuracy + f_reliability + f_speed + f_attitude + f_readability + f_efficiency) / 7, 2)
                         
-                        with open(FEEDBACK_FILE, mode="a", newline="", encoding="utf-8-sig") as f:
-                            writer = csv.writer(f)
-                            writer.writerow([
+                        # 구글 시트에 피드백 데이터 기록
+                        try:
+                            feedback_ws.append_row([
                                 timestamp, st.session_state.session_id, f_solving, f_accuracy, f_reliability, f_speed, 
                                 f_attitude, f_readability, f_efficiency, 
                                 final_alt_action, final_time_saved, avg_score, good_text, improve_text
                             ])
+                        except Exception as e:
+                            pass
                         
                         st.session_state.feedback_submitted = True
                         st.rerun()
