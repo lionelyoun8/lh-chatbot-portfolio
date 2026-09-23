@@ -294,76 +294,75 @@ else:
                 if st.button("💡 개선 사항을 제안하고 싶어요", use_container_width=True):
                     st.session_state.open_feedback_form = True
 
-                if st.session_state.open_feedback_form:
+            if st.session_state.open_feedback_form:
+                st.write("")
+                with st.form("main_feedback_form"):
+                    st.markdown("#### [1단계] 항목별 만족도 (1점 ~ 5점)")
+                    f_solving = st.slider("1. 문제 해결 기여도", 1, 5, 5)
+                    f_accuracy = st.slider("2. 정보의 정확성", 1, 5, 5)
+                    f_reliability = st.slider("3. 정보의 신뢰성", 1, 5, 5)
+                    f_speed = st.slider("4. 답변 속도", 1, 5, 5)
+                    f_attitude = st.slider("5. 챗봇 상담 태도", 1, 5, 5)
+                    f_readability = st.slider("6. 가독성", 1, 5, 5)
+                    f_efficiency = st.slider("7. 정보 탐색 수고 절감 (효율성)", 1, 5, 5)
+                    
+                    st.divider()
+                    st.markdown("#### [2단계] 서비스 효율성 측정")
+                    
+                    alt_action = st.radio(
+                        "8. 만약 이 챗봇이 없었다면 궁금한 점을 어떻게 해결하셨을 것 같나요?",
+                        options=[
+                            "LH 콜센터 상담이나 지사에 직접 전화 혹은 방문한다",
+                            "공고문과 특별법을 직접 찾아본다",
+                            "오픈채팅방을 이용한다",
+                            "인터넷에 검색한다",
+                            "다른 AI에게 물어본다",
+                            "포기한다",
+                            "기타"
+                        ]
+                    )
+                    alt_action_other = st.text_input("위 8번 문항에서 '기타'를 선택하신 경우, 직접 적어주세요.")
+                    
                     st.write("")
-                    with st.form("main_feedback_form"):
-                        st.markdown("#### [1단계] 항목별 만족도 (1점 ~ 5점)")
-                        f_solving = st.slider("1. 문제 해결 기여도", 1, 5, 5)
-                        f_accuracy = st.slider("2. 정보의 정확성", 1, 5, 5)
-                        f_reliability = st.slider("3. 정보의 신뢰성", 1, 5, 5)
-                        f_speed = st.slider("4. 답변 속도", 1, 5, 5)
-                        f_attitude = st.slider("5. 챗봇 상담 태도", 1, 5, 5)
-                        f_readability = st.slider("6. 가독성", 1, 5, 5)
-                        f_efficiency = st.slider("7. 정보 탐색 수고 절감 (효율성)", 1, 5, 5)
-                        
-                        st.divider()
-                        st.markdown("#### [2단계] 서비스 효율성 측정")
-                        
-                        alt_action = st.radio(
-                            "8. 만약 이 챗봇이 없었다면 궁금한 점을 어떻게 해결하셨을 것 같나요?",
-                            options=[
-                                "LH 콜센터 상담이나 지사에 직접 전화 혹은 방문한다",
-                                "공고문과 특별법을 직접 찾아본다",
-                                "오픈채팅방을 이용한다",
-                                "인터넷에 검색한다",
-                                "다른 AI에게 물어본다",
-                                "포기한다",
-                                "기타"
-                            ]
-                        )
-                        alt_action_other = st.text_input("위 8번 문항에서 '기타'를 선택하신 경우, 직접 적어주세요.")
-                        
-                        st.write("")
-                        
-                        time_saved = st.radio(
-                            "9. 이 챗봇 덕분에 정보를 찾는 시간을 대략 얼마나 단축했다고 생각하시나요?",
-                            options=["10분 이내", "30분 정도", "1시간 정도", "1시간 이상", "기타"]
-                        )
-                        time_saved_other = st.text_input("위 9번 문항에서 '기타'를 선택하신 경우, 단축된 시간을 직접 적어주세요.")
+                    
+                    time_saved = st.radio(
+                        "9. 이 챗봇 덕분에 정보를 찾는 시간을 대략 얼마나 단축했다고 생각하시나요?",
+                        options=["10분 이내", "30분 정도", "1시간 정도", "1시간 이상", "기타"]
+                    )
+                    time_saved_other = st.text_input("위 9번 문항에서 '기타'를 선택하신 경우, 단축된 시간을 직접 적어주세요.")
 
-                        st.divider()
-                        st.markdown("#### [3단계] 상세 피드백")
-                        st.caption("긍정적인 점과 아쉬운 점을 모두 남겨주시면 큰 도움이 됩니다!")
+                    st.divider()
+                    st.markdown("#### [3단계] 상세 피드백")
+                    st.caption("긍정적인 점과 아쉬운 점을 모두 남겨주시면 큰 도움이 됩니다!")
+                    
+                    good_text = st.text_area(
+                        "10. 이 챗봇의 어떤 점이 가장 좋았거나 도움이 되셨나요? (장점)", 
+                        placeholder="예: 복잡한 공고문을 쉽게 요약해줘서 좋았어요."
+                    )
+                    
+                    improve_text = st.text_area(
+                        "11. 더 나은 서비스를 위해 개선해야 할 점이 있다면 적어주세요. (개선점)", 
+                        placeholder="예: 000에 대한 정보가 더 추가되면 좋겠어요."
+                    )
+                    
+                    submitted = st.form_submit_button("피드백 제출하기")
+                    if submitted:
+                        final_alt_action = alt_action_other if alt_action == "기타" and alt_action_other else alt_action
+                        final_time_saved = time_saved_other if time_saved == "기타" and time_saved_other else time_saved
                         
-                        good_text = st.text_area(
-                            "10. 이 챗봇의 어떤 점이 가장 좋았거나 도움이 되셨나요? (장점)", 
-                            placeholder="예: 복잡한 공고문을 쉽게 요약해줘서 좋았어요."
-                        )
+                        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        avg_score = round((f_solving + f_accuracy + f_reliability + f_speed + f_attitude + f_readability + f_efficiency) / 7, 2)
                         
-                        improve_text = st.text_area(
-                            "11. 더 나은 서비스를 위해 개선해야 할 점이 있다면 적어주세요. (개선점)", 
-                            placeholder="예: 000에 대한 정보가 더 추가되면 좋겠어요."
-                        )
+                        try:
+                            feedback_ws.append_row([
+                                timestamp, st.session_state.session_id, f_solving, f_accuracy, f_reliability, f_speed, 
+                                f_attitude, f_readability, f_efficiency, 
+                                final_alt_action, final_time_saved, avg_score, good_text, improve_text
+                            ])
+                        except Exception as e:
+                            pass
                         
-                        submitted = st.form_submit_button("피드백 제출하기")
-                        if submitted:
-                            final_alt_action = alt_action_other if alt_action == "기타" and alt_action_other else alt_action
-                            final_time_saved = time_saved_other if time_saved == "기타" and time_saved_other else time_saved
-                            
-                            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                            avg_score = round((f_solving + f_accuracy + f_reliability + f_speed + f_attitude + f_readability + f_efficiency) / 7, 2)
-                            
-                            # 구글 시트에 피드백 데이터 기록
-                            try:
-                                feedback_ws.append_row([
-                                    timestamp, st.session_state.session_id, f_solving, f_accuracy, f_reliability, f_speed, 
-                                    f_attitude, f_readability, f_efficiency, 
-                                    final_alt_action, final_time_saved, avg_score, good_text, improve_text
-                                ])
-                            except Exception as e:
-                                pass
-                            
-                            st.session_state.feedback_submitted = True
-                            st.rerun()
-            else:
-                st.success("🎉 따뜻한 의견 감사합니다. 더 나은 서비스로 보답하겠습니다.")
+                        st.session_state.feedback_submitted = True
+                        st.rerun()
+        else:
+            st.success("🎉 따뜻한 의견 감사합니다. 더 나은 서비스로 보답하겠습니다.")
