@@ -3,6 +3,7 @@ import uuid
 from datetime import datetime
 from google import genai
 from google.genai import types
+from google.genai import errors
 import streamlit as st
 import pandas as pd
 import gspread
@@ -100,13 +101,41 @@ if "uploaded_docs" not in st.session_state:
         if os.path.exists(file_path):
             try:
                 doc = client.files.upload(
-                    file=file_path, 
-                    config={'display_name': display_name}
+                    file=file_path,
+                    config={"display_name": display_name}
                 )
+
+                # PDF가 Gemini 서버에서 처리되는 동안 바로 질문을 보내지 않도록
+                # ACTIVE 상태가 될 때까지 최대 30초간 확인합니다.
+                import time
+                for _ in range(30):
+                    state = getattr(doc, "state", None)
+                    state_name = getattr(state, "name", str(state)) if state is not None else "ACTIVE"
+
+                    if state_name == "ACTIVE":
+                        break
+                    if state_name == "FAILED":
+                        raise RuntimeError(f"Gemini 파일 처리 실패: {display_name}")
+
+                    time.sleep(1)
+                    doc = client.files.get(name=doc.name)
+
+                state = getattr(doc, "state", None)
+                state_name = getattr(state, "name", str(state)) if state is not None else "ACTIVE"
+
+                if state_name != "ACTIVE":
+                    raise RuntimeError(
+                        f"Gemini 파일 처리 대기시간 초과: {display_name} (상태: {state_name})"
+                    )
+
                 st.session_state["uploaded_docs"].append(doc)
                 st.session_state["uploaded_filenames"].append(display_name)
+
             except Exception as e:
-                pass
+                st.warning(
+                    f"문서 업로드 실패: {display_name} / "
+                    f"{type(e).__name__}: {e}"
+                )
 
 # ---------------------------------------------------------
 # 왼쪽 사이드바 (설정 및 데이터 대시보드)
@@ -247,15 +276,57 @@ else:
                 contents_to_send.extend(st.session_state["uploaded_docs"])
             contents_to_send.append(prompt)
 
-            response = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=contents_to_send,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_prompt,
+            try:
+                response = client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=contents_to_send,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_prompt,
+                    )
                 )
-            )
-            
-            ai_text = response.text
+
+                ai_text = response.text
+
+                if not ai_text:
+                    raise RuntimeError("Gemini가 빈 응답을 반환했습니다.")
+
+            except errors.APIError as e:
+                status_code = getattr(e, "code", "unknown")
+
+                st.error(
+                    f"⚠️ Gemini API 요청에 실패했습니다. "
+                    f"(HTTP {status_code})\n\n{e}"
+                )
+
+                if status_code == 401:
+                    st.info(
+                        "API 키가 잘못되었거나 만료되었을 가능성이 있습니다. "
+                        "Streamlit Cloud → Settings → Secrets의 "
+                        "GEMINI_API_KEY를 확인하세요."
+                    )
+                elif status_code == 403:
+                    st.info(
+                        "Gemini API 사용 권한 또는 Google Cloud 프로젝트 권한을 확인하세요."
+                    )
+                elif status_code == 429:
+                    st.info(
+                        "Gemini API 사용량 또는 요청 한도를 초과했을 가능성이 있습니다."
+                    )
+                elif status_code == 400:
+                    st.info(
+                        "요청 형식 또는 Gemini 파일 상태 문제일 가능성이 있습니다. "
+                        "위 문서 업로드 상태 메시지도 확인하세요."
+                    )
+
+                st.stop()
+
+            except Exception as e:
+                st.error(
+                    f"⚠️ Gemini 호출 중 예기치 않은 오류가 발생했습니다.\n\n"
+                    f"{type(e).__name__}: {e}"
+                )
+                st.stop()
+
             st.markdown(ai_text)
             st.session_state.messages.append({"role": "assistant", "content": ai_text})
             
