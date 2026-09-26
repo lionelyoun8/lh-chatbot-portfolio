@@ -1,9 +1,9 @@
 import os
 import re
+import json
 import time
 import uuid
 from datetime import datetime
-from urllib.parse import quote
 
 import gspread
 import pandas as pd
@@ -13,9 +13,6 @@ from google.genai import errors, types
 from google.oauth2.service_account import Credentials
 
 
-# =========================================================
-# 기본 설정
-# =========================================================
 st.set_page_config(
     page_title="LH 전세사기 피해주택 매입 Q&A 챗봇",
     page_icon="🏠",
@@ -24,7 +21,7 @@ st.set_page_config(
 
 GEMINI_MODEL = st.secrets.get("GEMINI_MODEL", "gemini-3.6-flash")
 VERIFY_ANSWER_WITH_SECOND_PASS = True
-FALLBACK_PHRASE = "현재 참고 자료에서 확인하기 어려운 내용입니다. 정확한 안내는 관련 담당 기관에 직접 확인해 주세요."
+FALLBACK_PHRASE = "현재 참고 문서에서는 해당 내용을 명확히 확인하기 어렵습니다. 정확한 안내는 아래 관련 기관에 문의해 주세요."
 
 DOCUMENT_FRESHNESS_CAUTION = (
     "※ 답변은 「전세사기피해자 지원 및 주거안정에 관한 특별법」, "
@@ -36,39 +33,34 @@ DOCUMENT_FRESHNESS_CAUTION = (
 client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
 
 
-# =========================================================
-# 개인정보 마스킹
-# - 모델 답변에는 원문 질문을 사용하되,
-# - Google Sheets에 저장할 때만 마스킹한다.
-# =========================================================
 def mask_personal_info(text: str) -> str:
     if not text:
         return ""
 
     masked = str(text)
 
-    # 주민등록번호
+
     masked = re.sub(
         r"(?<!\d)\d{6}\s*-?\s*[1-4]\d{6}(?!\d)",
         "[주민등록번호]",
         masked,
     )
 
-    # 휴대전화 / 대표적인 국내 전화번호
+
     masked = re.sub(
         r"(?<!\d)(?:01[016789]|02|0[3-6][1-5])[-.\s]?\d{3,4}[-.\s]?\d{4}(?!\d)",
         "[전화번호]",
         masked,
     )
 
-    # 이메일
+
     masked = re.sub(
         r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
         "[이메일]",
         masked,
     )
 
-    # 계좌번호: '계좌/계좌번호' 뒤에 이어지는 숫자열 중심으로 보수적으로 마스킹
+
     masked = re.sub(
         r"((?:계좌번호|계좌)\s*[:：]?\s*)(?:\d[\d\-\s]{7,}\d)",
         r"\1[계좌번호]",
@@ -76,15 +68,14 @@ def mask_personal_info(text: str) -> str:
         flags=re.IGNORECASE,
     )
 
-    # 상세 주소의 번지/건물번호 부분만 마스킹하여 시·군·구 수준은 남김
-    # 예: '전주시 완산구 홍산로 158' -> '전주시 완산구 홍산로 [상세주소]'
+
     masked = re.sub(
         r"([가-힣A-Za-z0-9]+(?:로|길|동|읍|면)\s*)\d+(?:-\d+)?",
         r"\1[상세주소]",
         masked,
     )
 
-    # 아파트/건물 동·호수
+
     masked = re.sub(
         r"(?<!\d)\d{1,4}\s*동\s*\d{1,5}\s*호(?!\d)",
         "[동·호수]",
@@ -94,13 +85,6 @@ def mask_personal_info(text: str) -> str:
     return masked
 
 
-# =========================================================
-# 공식 문의처 디렉터리 / 추천 라우팅
-# - 전화번호는 모델이 생성하지 않는다.
-# - 아래 값은 현재 함께 사용하는 3개 공식 자료에서 직접 확인한 연락처만 저장한다.
-# - 사용자의 질문·지역을 코드에서 분류해 최대 3곳을 추천한다.
-# - 세부 제도 설명은 여전히 Gemini가 3개 문서를 직접 참고해 답한다.
-# =========================================================
 CONTACT_REQUEST_KEYWORDS = [
     "전화", "전화번호", "연락처", "문의처", "어디 문의", "어디에 문의",
     "어디로 문의", "어디에 전화", "어디로 전화", "기관", "상담센터",
@@ -112,7 +96,6 @@ def wants_contact_info(text: str) -> bool:
     return any(keyword in t for keyword in CONTACT_REQUEST_KEYWORDS)
 
 
-# 전국 단위/전문 문의처
 NATIONAL_CONTACTS = {
     "hug_general": {
         "name": "HUG 전세피해지원센터",
@@ -153,7 +136,6 @@ NATIONAL_CONTACTS = {
 }
 
 
-# 전세사기피해자 결정 신청/전세피해 지원을 위한 지역별 공식 접수·상담 창구
 LOCAL_VICTIM_CENTERS = {
     "서울": {"name": "서울 전월세 종합지원센터", "phones": ["02-2133-1200~8"]},
     "인천": {"name": "인천 전세피해지원센터", "phones": ["032-440-1803"]},
@@ -176,8 +158,6 @@ LOCAL_VICTIM_CENTERS = {
 LOCAL_VICTIM_CENTER_SOURCE = "「전세피해지원 프로그램 및 전세피해 상담 사례집」 4~5쪽"
 
 
-# LH 피해주택 매입 / 우선공급·긴급주거지원 문의처
-# notice.pdf 2쪽 표를 그대로 구조화했다.
 LH_REGIONAL_CONTACTS = {
     "서울지역본부": {
         "purchase": ["02-2015-1030"],
@@ -283,7 +263,7 @@ def _contains_any(text: str, words) -> bool:
 def detect_support_region(text: str):
     t = str(text or "")
 
-    # 광역시·도 이름이 명시된 경우를 먼저 처리한다.
+
     explicit_checks = [
         ("인천", ["인천"]), ("부산", ["부산"]), ("대전", ["대전"]),
         ("대구", ["대구"]), ("울산", ["울산"]), ("세종", ["세종"]),
@@ -306,13 +286,13 @@ def detect_support_region(text: str):
         return "경기"
     if "서울" in t:
         return "서울"
-    # 구 이름만 나온 경우는 다른 광역시가 명시되지 않은 때에만 서울 자치구로 해석한다.
+
     if _contains_any(t, SEOUL_DISTRICTS):
         return "서울"
     if "광주" in t:
         return "광주"
 
-    # 시 이름만 말한 경우의 보조 매핑
+
     for region, aliases in SUPPORT_REGION_ALIASES.items():
         if any(alias in t for alias in aliases):
             return region
@@ -322,7 +302,7 @@ def detect_support_region(text: str):
 def detect_lh_region(text: str):
     t = str(text or "")
 
-    # 다른 광역시 명칭을 서울 자치구명보다 먼저 판정한다(예: 부산 강서구).
+
     if "부산" in t or "울산" in t:
         return "부산울산지역본부"
     if "인천" in t:
@@ -344,7 +324,7 @@ def detect_lh_region(text: str):
     if "제주" in t:
         return "제주지역본부"
 
-    # 경기도는 공고문상 남부/북부/인천(부천) 관할이 나뉘므로 세부 시·군을 먼저 본다.
+
     if "부천" in t:
         return "인천지역본부"
     if _contains_any(t, GYEONGGI_SOUTH_CITIES):
@@ -437,7 +417,7 @@ def _lh_contact_for(text: str, lh_region: str, kind: str):
     return _contact_item(lh_region, phones, purpose, LH_CONTACT_SOURCE)
 
 
-def recommend_contacts(text: str, max_items=3):
+def recommend_contacts(text: str, max_items=3, include_generic=True):
     t = str(text or "")
     intents = detect_contact_intents(t)
     support_region = detect_support_region(t)
@@ -455,7 +435,7 @@ def recommend_contacts(text: str, max_items=3):
         seen.add(key)
         result.append(item)
 
-    # 가장 전문성이 높은 문의처부터 우선
+
     if "psych" in intents:
         add(NATIONAL_CONTACTS["psych"])
     if "welfare" in intents:
@@ -465,13 +445,13 @@ def recommend_contacts(text: str, max_items=3):
     if "auction" in intents:
         add(NATIONAL_CONTACTS["hug_auction"])
 
-    # LH 매입과 주거지원은 공고문이 두 문의번호를 명확히 구분하고 있어 따로 라우팅
+
     if "purchase" in intents:
         add(_lh_contact_for(t, lh_region, "purchase"))
     if "housing" in intents:
         add(_lh_contact_for(t, lh_region, "supply"))
 
-    # 피해자 결정·법률·금융·일반 피해지원은 지역 접수처가 있으면 우선 활용
+
     if support_region and (
         not intents
         or intents.intersection({"victim_decision", "legal", "finance", "auction", "housing", "purchase"})
@@ -490,8 +470,8 @@ def recommend_contacts(text: str, max_items=3):
     if "molit" in intents:
         add(NATIONAL_CONTACTS["molit"])
 
-    # 문의 목적이 애매한 경우: 지역센터 → HUG 일반상담 → 국토부 순으로 안전하게 제시
-    if not result:
+
+    if include_generic and not result:
         if support_region:
             c = LOCAL_VICTIM_CENTERS.get(support_region)
             if c:
@@ -511,7 +491,7 @@ def strip_model_phone_numbers(text: str) -> str:
     """전화번호는 하드코딩된 공식 디렉터리에서만 노출되도록 모델 생성 번호를 제거한다."""
     if not text:
         return ""
-    # 02/지역번호/대표번호와 129를 제거. 법 조문·연도·금액 숫자는 건드리지 않는다.
+
     cleaned = re.sub(
         r"(?<!\d)(?:0\d{1,2}-\d{3,4}-\d{4}|1\d{3}-\d{4})(?:\s*[~,]\s*\d{1,4})*",
         "[공식 문의처는 아래 안내 참고]",
@@ -525,7 +505,7 @@ def append_contact_recommendations(ai_text: str, contacts):
     if not contacts:
         return ai_text
 
-    # 모델 답변의 출처 한 줄을 잠시 분리해 문의처 출처와 함께 맨 아래에 모은다.
+
     source_matches = re.findall(r"(?m)^출처:\s*(.+?)\s*$", ai_text or "")
     body = re.sub(r"(?m)^출처:\s*.+?\s*$", "", ai_text or "").rstrip()
 
@@ -546,9 +526,203 @@ def append_contact_recommendations(ai_text: str, contacts):
     return "\n".join(lines)
 
 
-# =========================================================
-# Google Sheets
-# =========================================================
+BROAD_FALLBACK_CONTACT_NAMES = {
+    "HUG 전세피해지원센터",
+    "국토교통부 피해지원총괄과",
+}
+
+
+def _contacts_are_only_broad(contacts) -> bool:
+    if not contacts:
+        return True
+    return all(c.get("name") in BROAD_FALLBACK_CONTACT_NAMES for c in contacts)
+
+
+def _parse_json_array(raw_text: str):
+    text = (raw_text or "").strip()
+    if not text:
+        return []
+
+
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*```$", "", text)
+
+    try:
+        data = json.loads(text)
+    except Exception:
+
+        start = text.find("[")
+        end = text.rfind("]")
+        if start == -1 or end == -1 or end <= start:
+            return []
+        try:
+            data = json.loads(text[start:end + 1])
+        except Exception:
+            return []
+
+    return data if isinstance(data, list) else []
+
+
+def _valid_phone_string(phone: str) -> bool:
+    p = str(phone or "").strip()
+    return bool(re.fullmatch(
+        r"(?:0\d{1,2}-\d{3,4}-\d{4}(?:~\d{1,4})?|1\d{2,3}-\d{4}|129)",
+        p,
+    ))
+
+
+def _sanitize_document_contacts(items, max_items=3):
+    cleaned = []
+    seen = set()
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+
+        name = str(item.get("name", "")).strip()
+        purpose = str(item.get("purpose", "")).strip()
+        source = str(item.get("source", "")).strip()
+        phones_raw = item.get("phones", [])
+        if isinstance(phones_raw, str):
+            phones_raw = [phones_raw]
+        if not isinstance(phones_raw, list):
+            continue
+
+        phones = []
+        for phone in phones_raw:
+            p = str(콜).strip()
+            if _valid_phone_string(p) and p not in phones:
+                phones.append(p)
+
+
+        if not name or not phones or not source:
+            continue
+
+        key = (name, tuple(phones))
+        if key in seen:
+            continue
+        seen.add(key)
+
+        cleaned.append(_contact_item(
+            name=name,
+            phones=phones,
+            purpose=purpose or "관련 문의",
+            source=source,
+        ))
+
+        if len(cleaned) >= max_items:
+            break
+
+    return cleaned
+
+
+def find_verified_document_contacts(question: str, max_items=3):
+    """
+    하드코딩 디렉터리에서 구체적인 번호를 찾지 못했을 때만 호출한다.
+    1차: 세 참고 문서에서 기관명+전화번호 후보를 그대로 추출
+    2차: 같은 문서로 후보가 실제로 명시되어 있는지 독립 검증
+    검증기가 새 번호를 만들 수 없도록 1차 후보와 완전히 동일한 기관명/번호 조합만 허용한다.
+    """
+    if not uploaded_docs:
+        return []
+
+    extraction_prompt = f"""
+당신은 공식 문서의 연락처 추출기입니다.
+아래 사용자 질문과 직접 관련된 공식 문의기관과 전화번호를, 함께 제공된 참고 문서에서만 찾으십시오.
+인터넷, 기억, 일반지식은 사용하지 마십시오.
+
+[사용자 질문]
+{question}
+
+규칙:
+1. 기관명과 전화번호가 문서에서 명확하게 연결되어 적혀 있는 경우만 후보로 내십시오.
+2. 전화번호의 일부를 추정·보완하거나 다른 번호 형식으로 고치지 마십시오.
+3. 질문과 관련성이 높은 기관만 최대 {max_items}개 제시하십시오.
+4. 출처는 실제 문서명과 PDF 페이지를 정확히 적으십시오. 예: 「전세피해지원 프로그램 및 전세피해 상담 사례집」 13쪽
+5. 문서에서 확실한 번호를 찾지 못하면 []만 출력하십시오.
+6. 설명 문장이나 마크다운 없이 아래 JSON 배열 형식만 출력하십시오.
+
+[
+  {{"name":"기관명","phones":["전화번호"],"purpose":"이 기관에 문의할 이유","source":"문서명 + 페이지"}}
+]
+"""
+
+    try:
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=list(uploaded_docs) + [extraction_prompt],
+            config=types.GenerateContentConfig(temperature=0.0),
+        )
+        candidates = _sanitize_document_contacts(
+            _parse_json_array(response.text or ""),
+            max_items=max_items,
+        )
+    except Exception:
+        return []
+
+    if not candidates:
+        return []
+
+    candidate_json = json.dumps(candidates, ensure_ascii=False)
+    verification_prompt = f"""
+당신은 공식 연락처 검증기입니다.
+함께 제공된 참고 문서만 사용해 아래 후보를 검증하십시오.
+인터넷, 기억, 일반지식은 사용하지 마십시오.
+
+[사용자 질문]
+{question}
+
+[검증할 후보]
+{candidate_json}
+
+규칙:
+1. 각 후보의 기관명과 전화번호가 참고 문서에 실제로 함께 명시되어 있는지 확인하십시오.
+2. 전화번호가 한 자리라도 불확실하거나, 기관명과 번호의 연결이 명확하지 않으면 그 후보를 제거하십시오.
+3. 질문과 무관한 기관도 제거하십시오.
+4. source의 문서명과 페이지도 실제 위치와 맞아야 합니다.
+5. 후보의 기관명이나 전화번호를 수정하거나 새로운 번호를 추가하지 마십시오. 검증된 후보만 그대로 남기십시오.
+6. 설명 문장이나 마크다운 없이 JSON 배열만 출력하십시오. 모두 탈락하면 []만 출력하십시오.
+"""
+
+    try:
+        verified_response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=list(uploaded_docs) + [verification_prompt],
+            config=types.GenerateContentConfig(temperature=0.0),
+        )
+        verified = _sanitize_document_contacts(
+            _parse_json_array(verified_response.text or ""),
+            max_items=max_items,
+        )
+    except Exception:
+        return []
+
+
+    candidate_keys = {
+        (c["name"], tuple(c["phones"]))
+        for c in candidates
+    }
+    final = [
+        c for c in verified
+        if (c["name"], tuple(c["phones"])) in candidate_keys
+    ]
+    return final[:max_items]
+
+
+def merge_contacts(primary, secondary, max_items=3):
+    result = []
+    seen = set()
+    for item in list(primary or []) + list(secondary or []):
+        key = (item.get("name"), tuple(item.get("phones", [])))
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+        if len(result) >= max_items:
+            break
+    return result
+
+
 @st.cache_resource
 def init_google_sheets():
     scope = [
@@ -569,7 +743,7 @@ def get_or_create_worksheet(sheet, title, headers):
         ws.append_row(headers)
         return ws
 
-    # 기존 시트가 있어도 새 컬럼을 안전하게 추가
+
     try:
         current_headers = ws.row_values(1)
         changed = False
@@ -599,15 +773,15 @@ try:
     chat_headers = [
         "timestamp",
         "session_id",
-        "user_question",       # 마스킹된 질문
-        "ai_response",         # 마스킹된 답변
+        "user_question",
+        "ai_response",
         "verification_status",
         "contact_route",
     ]
     unanswered_headers = [
         "timestamp",
         "session_id",
-        "unanswered_question",  # 마스킹된 질문
+        "unanswered_question",
         "contact_route",
     ]
     feedback_headers = [
@@ -623,13 +797,10 @@ try:
     SHEETS_AVAILABLE = True
 
 except Exception as e:
-    # 로그 저장 기능만 비활성화하고 챗봇 자체는 계속 사용 가능하게 한다.
+
     SHEETS_ERROR = f"{type(e).__name__}: {e}"
 
 
-# =========================================================
-# 세션 상태
-# =========================================================
 if "session_id" not in st.session_state:
     st.session_state.session_id = str(uuid.uuid4())
 if "messages" not in st.session_state:
@@ -651,14 +822,28 @@ if "counted_as_visitor" not in st.session_state:
             pass
 
 
-# =========================================================
-# 기본 PDF 업로드
-# =========================================================
 DEFAULT_FILES = {
     "notice.pdf": "전세사기 피해주택 매입 통합 공고",
     "law.pdf": "전세사기피해자 지원 및 주거안정에 관한 특별법",
-    "2025전세피해지원사례집.pdf": "전세피해지원 프로그램 및 전세피해 상담 사례집",
+    "hug_2025_casebook.pdf": "전세피해지원 프로그램 및 전세피해 상담 사례집",
 }
+
+
+DOCUMENT_FILE_ALIASES = {
+    "hug_2025_casebook.pdf": [
+        "hug_2025_casebook.pdf",
+        "2025전세피해지원사례집.pdf",
+        "2025전세피해지원사례집(1).pdf",
+    ],
+}
+
+
+def resolve_document_path(canonical_path: str):
+    candidates = DOCUMENT_FILE_ALIASES.get(canonical_path, [canonical_path])
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return None
 
 
 @st.cache_resource(show_spinner=False, ttl=60 * 60 * 24)
@@ -666,8 +851,9 @@ def upload_default_documents():
     docs = []
     filenames = []
 
-    for file_path, display_name in DEFAULT_FILES.items():
-        if not os.path.exists(file_path):
+    for canonical_path, display_name in DEFAULT_FILES.items():
+        file_path = resolve_document_path(canonical_path)
+        if not file_path:
             continue
 
         doc = client.files.upload(
@@ -705,9 +891,6 @@ except Exception as e:
     st.warning(f"기본 문서 업로드 중 오류가 발생했습니다: {type(e).__name__}: {e}")
 
 
-# =========================================================
-# 답변 생성 / 2차 근거 검증
-# =========================================================
 def build_history_text(messages, max_messages=6):
     recent = messages[-max_messages:]
     lines = []
@@ -845,18 +1028,8 @@ def verify_and_repair_answer(question: str, draft: str):
         if revised:
             return revised, "REVISED"
 
-    # 검증 결과 형식이 깨진 경우에도 검증되지 않은 초안은 사용자에게 보여주지 않음
+
     return FALLBACK_PHRASE, "VERIFY_PARSE_FAILED"
-
-
-# =========================================================
-# 참고 문서 원문 링크 / 서비스 설문
-# =========================================================
-GITHUB_REPO_BASE = "https://github.com/lionelyoun8/lh-chatbot-portfolio/blob/main"
-
-
-def github_file_url(filename: str) -> str:
-    return f"{GITHUB_REPO_BASE}/{quote(filename)}"
 
 
 def render_feedback_form(form_key: str = "sidebar_feedback_form"):
@@ -973,28 +1146,27 @@ def render_feedback_form(form_key: str = "sidebar_feedback_form"):
             st.rerun()
 
 
-# =========================================================
-# 사이드바
-# =========================================================
 with st.sidebar:
     st.header("⚙️ 챗봇 설정")
 
     st.subheader("📚 참고 문서")
     st.caption("챗봇이 답변할 때 참고하는 원문입니다.")
 
-    for file_path, display_name in DEFAULT_FILES.items():
+    for canonical_path, display_name in DEFAULT_FILES.items():
         st.markdown(f"**{display_name}**")
-        st.markdown(f"[📄 원문 보기]({github_file_url(file_path)})")
-        if os.path.exists(file_path):
+        file_path = resolve_document_path(canonical_path)
+        if file_path:
             with open(file_path, "rb") as pdf_file:
                 st.download_button(
-                    "⬇️ PDF 저장",
+                    "⬇️ PDF 다운로드",
                     data=pdf_file.read(),
-                    file_name=file_path,
+                    file_name=canonical_path,
                     mime="application/pdf",
-                    key=f"download_{file_path}",
+                    key=f"download_{canonical_path}",
                     use_container_width=True,
                 )
+        else:
+            st.warning(f"PDF 파일을 찾을 수 없습니다: {canonical_path}")
 
     st.divider()
 
@@ -1081,19 +1253,10 @@ with st.sidebar:
                 st.error("비밀번호가 올바르지 않습니다.")
 
 
-# =========================================================
-# 메인 화면
-# =========================================================
 st.header("🏠 LH 전세사기 피해주택 매입 Q&A 챗봇")
-st.caption(
-    "이 챗봇은 「전세사기피해자 지원 및 주거안정에 관한 특별법」, "
-    "「전세사기 피해주택 매입 통합 공고」, "
-    "「전세피해지원 프로그램 및 전세피해 상담 사례집」을 바탕으로 답변합니다."
-)
-
 st.warning(
     "⚠️ **이용 전 꼭 확인해 주세요**\n\n"
-    "이 챗봇의 답변은 위 세 자료를 바탕으로 생성한 **참고용 정보**입니다. "
+    "이 챗봇의 답변은 참고 자료를 바탕으로 생성한 **참고용 정보**입니다. "
     "AI의 특성상 일부 내용이나 근거가 부정확할 수 있으며, 개인의 구체적인 상황에 따라 적용 결과가 달라질 수 있습니다.\n\n"
     "**신청, 경·공매, 계약, 금전 지급 등 중요한 의사결정 전에는 반드시 LH 지역본부 또는 관련 담당기관에 직접 확인해 주세요.**\n\n"
     "서비스 개선을 위해 질문과 답변이 저장될 수 있으며, 저장 전 전화번호·주민등록번호·이메일·상세주소 등 주요 개인정보를 마스킹합니다."
@@ -1102,11 +1265,6 @@ st.caption(DOCUMENT_FRESHNESS_CAUTION)
 st.divider()
 
 
-# =========================================================
-# 자가진단 -> 챗봇 상담 순서로 한 화면에 배치
-# - 자가진단은 참고용 간이 확인이며 챗봇 이용을 막지 않는다.
-# - 체크박스 문구는 최초 app.py의 문구를 그대로 유지한다.
-# =========================================================
 st.subheader("✅ LH 전세사기 피해주택 매입 신청 자격 요건 자가 진단")
 st.markdown("정확하고 원활한 상담을 위해 **신청 자격 요건 3가지**를 먼저 확인해 주세요.")
 
@@ -1133,9 +1291,6 @@ elif check1 or check2 or check3:
 st.divider()
 
 
-# =========================================================
-# 챗봇 상담
-# =========================================================
 st.subheader("💬 챗봇 상담")
 st.caption("궁금한 내용을 자유롭게 질문해 주세요.")
 
@@ -1144,12 +1299,12 @@ for message in st.session_state.messages:
         st.markdown(message["content"])
 
 if prompt := st.chat_input("궁금한 점을 입력해주세요 (예: 매입 사전협의는 언제 신청할 수 있나요?)"):
-    # 현재 질문을 화면에 먼저 표시
+
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # 현재 질문을 제외한 직전 대화 맥락
+
     previous_messages = st.session_state.messages[:-1]
     history_text = build_history_text(previous_messages, max_messages=6)
     contact_context = "\n".join(
@@ -1158,21 +1313,84 @@ if prompt := st.chat_input("궁금한 점을 입력해주세요 (예: 매입 사
 
     with st.chat_message("assistant"):
         try:
+
+
+            contact_query = f"{contact_context}\n{prompt}"
+            direct_contact_request = wants_contact_info(prompt)
+
             draft = generate_answer(prompt, history_text)
 
             verification_status = "NOT_RUN"
-            try:
-                ai_text, verification_status = verify_and_repair_answer(prompt, draft)
-            except Exception:
-                # 검증에 실패한 경우 검증되지 않은 초안을 노출하지 않고 동일한 안내 문구 사용
-                ai_text = FALLBACK_PHRASE
-                verification_status = "VERIFY_API_FAILED"
+            skip_second_pass = False
 
-            # 전화번호는 모델이 아니라 검증된 하드코딩 디렉터리에서만 노출한다.
-            # 현재 질문 + 최근 사용자 대화에서 문의 목적과 지역을 파악해 최대 3곳 추천한다.
-            contact_query = f"{contact_context}\n{prompt}"
+
+            if FALLBACK_PHRASE in draft:
+                ai_text = draft
+                verification_status = "SKIPPED_FALLBACK"
+                skip_second_pass = True
+
+
+            elif direct_contact_request:
+                ai_text = draft
+                verification_status = "SKIPPED_CONTACT"
+                skip_second_pass = True
+
+            if not skip_second_pass:
+                try:
+                    ai_text, verification_status = verify_and_repair_answer(prompt, draft)
+                except Exception:
+
+                    ai_text = FALLBACK_PHRASE
+                    verification_status = "VERIFY_API_FAILED"
+
+
             wants_contact = wants_contact_info(contact_query)
-            contacts = recommend_contacts(contact_query, max_items=3) if wants_contact else []
+
+
+            answer_is_fallback = (
+                FALLBACK_PHRASE in ai_text
+                or verification_status in {
+                    "UNSUPPORTED", "VERIFY_API_FAILED", "VERIFY_PARSE_FAILED", "SKIPPED_FALLBACK"
+                }
+            )
+            should_recommend_contacts = wants_contact or answer_is_fallback
+            contacts = []
+
+            if should_recommend_contacts:
+
+                hardcoded_contacts = recommend_contacts(
+                    contact_query,
+                    max_items=3,
+                    include_generic=False,
+                )
+
+
+                document_contacts = []
+                if _contacts_are_only_broad(hardcoded_contacts):
+                    document_contacts = find_verified_document_contacts(
+                        contact_query,
+                        max_items=3,
+                    )
+
+                if document_contacts:
+
+
+                    contacts = merge_contacts(
+                        document_contacts,
+                        hardcoded_contacts,
+                        max_items=3,
+                    )
+                else:
+                    contacts = hardcoded_contacts
+
+
+                if not contacts:
+                    contacts = recommend_contacts(
+                        contact_query,
+                        max_items=3,
+                        include_generic=True,
+                    )
+
             contact_route = ",".join(c["name"] for c in contacts)
 
             ai_text = strip_model_phone_numbers(ai_text)
@@ -1202,9 +1420,7 @@ if prompt := st.chat_input("궁금한 점을 입력해주세요 (예: 매입 사
 
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # -------------------------------------------------
-        # 저장할 때만 개인정보 마스킹
-        # -------------------------------------------------
+
         masked_prompt = mask_personal_info(prompt)
         masked_ai_text = mask_personal_info(ai_text)
 
